@@ -30,6 +30,7 @@
 module tb_ascon_aead_hash();
     parameter integer SPLIT_ROUND  = 0;
     parameter integer MERGE_ABSORB = 0;
+    parameter integer LEGACY_SCHEDULE = 0;   // 1: previous core (sources_1/v1), cycles = 8R+A / 12R+A
     parameter integer STALL        = 1;   // enable random out_ready stalls
 
     `include "tb_vectors.svh"
@@ -101,14 +102,30 @@ module tb_ascon_aead_hash();
     // Present a block and hold it until accepted.  in_valid stays high so
     // consecutive calls form a back-to-back stream; call end_stream() after.
     task automatic send_block(input logic [127:0] data, input int len, input bit last, input bit ad,
-                              output logic [127:0] captured, output bit got_out);
+                              output logic [127:0] captured, output bit got_out,
+                              input bit expect_out = 1'b0);
+        int guard;
         @(negedge clk);
         in_valid = 1'b1; in_data = data; in_len = len[4:0]; in_last = last; in_ad = ad;
         #1;
         while (!in_ready) begin @(negedge clk); #1; end
-        got_out  = out_valid & out_ready;
+        got_out  = out_valid & out_ready;     // v1: output offered in the accept cycle
         captured = out_data;
         @(posedge clk);                       // block accepted here
+        if (expect_out && !got_out) begin     // v2: output offered after the accept
+            guard = 0;
+            forever begin
+                @(negedge clk);
+                in_valid = 1'b0;              // drive only at negedge (no posedge race)
+                #1;
+                if (out_valid && out_ready) begin
+                    got_out = 1'b1; captured = out_data;
+                    @(posedge clk);
+                    break;
+                end
+                if (++guard > 64) break;
+            end
+        end
     endtask
 
     task automatic end_stream();
@@ -197,7 +214,7 @@ module tb_ascon_aead_hash();
 
         got_data = '0;
         if (plen == 0) begin
-            send_block('0, 0, 1'b1, 1'b0, cap, got);
+            send_block('0, 0, 1'b1, 1'b0, cap, got, 1'b1);
             if (!got) begin $display("AEAD %0d: no output handshake on empty block", idx); errors++; end
         end else begin
             off = 0;
@@ -205,12 +222,12 @@ module tb_ascon_aead_hash();
                 blen = (plen - off > 16) ? 16 : (plen - off);
                 last = (off + blen == plen);
                 if (last && blen == 16 && explicit_pad) begin
-                    send_block(src[8*off +: 128], 16, 1'b0, 1'b0, cap, got);
+                    send_block(src[8*off +: 128], 16, 1'b0, 1'b0, cap, got, 1'b1);
                     got_data[8*off +: 128] = cap;
                     if (!got) begin $display("AEAD %0d: missing output at byte %0d", idx, off); errors++; end
-                    send_block('0, 0, 1'b1, 1'b0, cap, got);   // explicit empty last block
+                    send_block('0, 0, 1'b1, 1'b0, cap, got, 1'b1);   // explicit empty last block
                 end else begin
-                    send_block(src[8*off +: 128], blen, last, 1'b0, cap, got);
+                    send_block(src[8*off +: 128], blen, last, 1'b0, cap, got, 1'b1);
                     got_data[8*off +: 128] = cap;
                     if (!got) begin $display("AEAD %0d: missing output at byte %0d", idx, off); errors++; end
                 end
@@ -268,8 +285,9 @@ module tb_ascon_aead_hash();
         stall_en = 1'b0;
 
         // rounds x (1 or 2 cycles) + one absorb cycle unless merged into the first round
-        measure(1'b0, 12 * (SPLIT_ROUND ? 2 : 1) + (MERGE_ABSORB ? 0 : 1));
-        measure(1'b1,  8 * (SPLIT_ROUND ? 2 : 1) + (MERGE_ABSORB ? 0 : 1));
+        // current core: 12 / 8 cycles per block regardless of the parameters
+        measure(1'b0, LEGACY_SCHEDULE ? 12 * (SPLIT_ROUND ? 2 : 1) + (MERGE_ABSORB ? 0 : 1) : 12);
+        measure(1'b1, LEGACY_SCHEDULE ?  8 * (SPLIT_ROUND ? 2 : 1) + (MERGE_ABSORB ? 0 : 1) : 8);
 
         if (errors == 0)
             $display("ALL TESTS PASSED (SPLIT_ROUND=%0d MERGE_ABSORB=%0d): %0d hash, %0d encrypt, %0d decrypt vectors",

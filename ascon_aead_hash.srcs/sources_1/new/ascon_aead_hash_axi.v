@@ -1,6 +1,16 @@
 `timescale 1ns / 1ps
-// ============================================================================
-// ascon_aead_hash_axi.v -- AXI4-Lite wrapper for the unified Ascon core
+//////////////////////////////////////////////////////////////////////////////////
+// Company:
+// Engineer:
+//
+// Create Date: 10/12/2026 05:00:00 PM
+// Design Name:
+// Module Name: ascon_aead_hash_axi
+// Project Name:
+// Target Devices:
+// Tool Versions:
+// Description:
+// AXI4-Lite wrapper for the unified Ascon core
 //
 // Register map (32-bit registers on 16-byte boundaries, see docs/REGISTER_MAP.md)
 //   0x000 CONTROL     W/R  bit0 start, bit1 soft reset, bits3:2 mode
@@ -13,7 +23,16 @@
 //   0x300..0x330 OUTPUT0..3, 0x340 OUTPUT_META (bit14 last, bits4:0 bytes),
 //   0x350 OUTPUT_POP  W    bit0 = 1 releases the output mailbox
 //   0x400..0x430 TAG0..3,   0x440 TAG_POP (bit0 = 1 releases the tag)
-// ============================================================================
+//
+// Dependencies: 
+//
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+//
+//////////////////////////////////////////////////////////////////////////////////
+
+
 module ascon_aead_hash_axi #(
     parameter integer C_S_AXI_DATA_WIDTH = 32,
     parameter integer C_S_AXI_ADDR_WIDTH = 12,

@@ -1,224 +1,118 @@
-from time import perf_counter
-from typing import Dict, Optional
+#!/usr/bin/env python3
+"""PYNQ-Z1 transport for the unified Ascon core (`ascon_aead_hash_axi`).
 
-import numpy as np
-from pynq import Overlay, allocate
+Loads the overlay built by scripts/build_pynq_overlay.tcl (build/ascon_pynq.bit
++ .hwh), finds the core's AXI4-Lite window and hands it to the register-level
+driver in ascon_axi.py.  Run on the board as root (PYNQ default).
 
+    from ascon_pynq_driver import open_hw
+    core = open_hw()                       # AxiEngine over pynq.MMIO
+    core = open_hw(use_c=True)             # MmioCEngine (C block loop, faster)
+    digest = core.hash256(b"abc")
 
-CONTROL = 0x000
-MODE = 0x004
-STATUS = 0x008
+The previous file of this name drove the old DMA-based Kria design and is
+obsolete: the unified core is a mailbox-style AXI4-Lite slave (see
+docs/REGISTER_MAP.md).
+"""
+from __future__ import annotations
 
-KEY_127_96 = 0x010
-KEY_95_64 = 0x014
-KEY_63_32 = 0x018
-KEY_31_0 = 0x01C
+import os
+import sys
+import time
+from typing import Optional
 
-NONCE_127_96 = 0x020
-NONCE_95_64 = 0x024
-NONCE_63_32 = 0x028
-NONCE_31_0 = 0x02C
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from ascon_axi import DEFAULT_BASE_ADDR, AsconAxiLite  # noqa: E402
+from ascon_engines import AxiEngine  # noqa: E402
 
-TAG_CTRL = 0x040
-TAG_127_96 = 0x044
-TAG_95_64 = 0x048
-TAG_63_32 = 0x04C
-TAG_31_0 = 0x050
-
-HASH_CTRL = 0x060
-CYCLE_LO = 0x064
-CYCLE_HI = 0x068
-
-ST_ENC_READY = 1 << 0
-ST_ENC_OUT_VALID = 1 << 1
-ST_DEC_READY = 1 << 2
-ST_DEC_OUT_VALID = 1 << 3
-ST_HASH_READY = 1 << 4
-ST_HASH_VALID = 1 << 5
-ST_HASH_LAST = 1 << 6
-ST_BUSY = 1 << 7
-
-START_RESET = 1 << 0
-START_ENCRYPT = 1 << 1
-START_DECRYPT = 1 << 2
-START_HASH = 1 << 3
+DEFAULT_BITSTREAM = os.path.normpath(os.path.join(HERE, "..", "build", "ascon_pynq.bit"))
+IP_KEYWORDS = ("ascon_axi", "ascon_aead_hash_axi", "ascon")
 
 
-class PYNQASCON:
-    def __init__(
-        self,
-        bitfile: str,
-        control_ip: Optional[str] = None,
-        dma_names: Optional[Dict[str, str]] = None,
-        pl_clock_hz: float = 100_000_000,
-    ):
-        self.overlay = Overlay(bitfile)
-        self.pl_clock_hz = pl_clock_hz
-        self.ip_name = self._pick_ip(control_ip, "ascon")
-        self.mmio = getattr(self.overlay, self.ip_name).mmio
+class PynqCore:
+    """Overlay + MMIO handle for the core; use `open_hw()` for an engine."""
 
-        if dma_names is None:
-            dma_names = {
-                "enc": "axi_dma_enc",
-                "dec": "axi_dma_dec",
-                "hash": "axi_dma_hash",
-                "ad": "axi_dma_ad",
-            }
+    def __init__(self, bitstream: Optional[str] = None, fclk_mhz: Optional[float] = None, timeout: float = 2.0):
+        try:
+            from pynq import MMIO, Overlay
+        except ImportError as exc:
+            raise RuntimeError("pynq is not installed; this transport only runs on the board") from exc
+        self.bitstream = bitstream or DEFAULT_BITSTREAM
+        if not os.path.exists(self.bitstream):
+            raise FileNotFoundError(f"bitstream not found: {self.bitstream} "
+                                    "(build it with scripts/build_pynq_overlay.tcl and copy .bit + .hwh)")
+        self.overlay = None
+        self.ip_name = None
+        try:
+            self.overlay = Overlay(self.bitstream)
+            names = [n for kw in IP_KEYWORDS for n in self.overlay.ip_dict if kw in n.lower()]
+            if not names:
+                raise RuntimeError(f"no Ascon IP in overlay: {list(self.overlay.ip_dict)}")
+            self.ip_name = names[0]
+            info = self.overlay.ip_dict[self.ip_name]
+            self.base_addr = int(info["phys_addr"])
+            self.mmio = MMIO(self.base_addr, int(info.get("addr_range", 0x1000)))
+        except Exception as exc:                     # HWH parsing problems: fixed-address fallback
+            from pynq import Bitstream
+            print(f"[ascon_pynq_driver] Overlay() failed ({exc}); using fixed base 0x{DEFAULT_BASE_ADDR:08x}")
+            Bitstream(self.bitstream).download()
+            self.base_addr = DEFAULT_BASE_ADDR
+            self.mmio = MMIO(self.base_addr, 0x1000)
+        if fclk_mhz:
+            self.set_fclk(fclk_mhz)
+        self.driver = AsconAxiLite(self.mmio, timeout=timeout)
 
-        self.dmas = {}
-        for role, name in dma_names.items():
-            if hasattr(self.overlay, name):
-                self.dmas[role] = getattr(self.overlay, name)
+    # ---- PL clock ---------------------------------------------------------
+    @staticmethod
+    def get_fclk() -> float:
+        from pynq.ps import Clocks
+        return float(Clocks.fclk0_mhz)
 
-        self.reset_core()
+    @staticmethod
+    def set_fclk(mhz: float) -> float:
+        """Re-program FCLK_CLK0 (the core clock).  The overlay is timed at the
+        frequency in scripts/build_pynq_overlay.tcl; higher values are at the
+        user's risk and must be validated with the self-test."""
+        from pynq.ps import Clocks
+        Clocks.fclk0_mhz = mhz
+        time.sleep(0.01)
+        return float(Clocks.fclk0_mhz)
 
-    def _pick_ip(self, name: Optional[str], keyword: str) -> str:
-        if name is not None:
-            if hasattr(self.overlay, name):
-                return name
-            raise ValueError(f"Control IP '{name}' not found in overlay")
+    def engine(self, use_c: bool = False):
+        if use_c:
+            from ascon_c import MmioCEngine
+            return MmioCEngine(self.base_addr)
+        return AxiEngine(self.driver, "hw")
 
-        candidates = [n for n in self.overlay.ip_dict.keys() if keyword in n.lower()]
-        if not candidates:
-            raise RuntimeError(f"No IP containing '{keyword}' found in overlay: {list(self.overlay.ip_dict)}")
-        return candidates[0]
 
-    def _write_u32(self, offset: int, value: int) -> None:
-        self.mmio.write(offset, value & 0xFFFFFFFF)
+def open_hw(bitstream: Optional[str] = None, fclk_mhz: Optional[float] = None, use_c: bool = False):
+    """Load the overlay and return an engine (`hw` Python driver or `hw-c` C loop)."""
+    core = PynqCore(bitstream, fclk_mhz)
+    eng = core.engine(use_c)
+    eng.pynq = core          # keep the overlay alive and reachable
+    return eng
 
-    def _read_u32(self, offset: int) -> int:
-        return self.mmio.read(offset) & 0xFFFFFFFF
 
-    def _write_u64(self, offset: int, value: int) -> None:
-        self._write_u32(offset + 0x0, (value >> 32) & 0xFFFFFFFF)
-        self._write_u32(offset + 0x4, value & 0xFFFFFFFF)
-
-    def _write_u128(self, offset: int, value: int) -> None:
-        self._write_u32(offset + 0x0, (value >> 96) & 0xFFFFFFFF)
-        self._write_u32(offset + 0x4, (value >> 64) & 0xFFFFFFFF)
-        self._write_u32(offset + 0x8, (value >> 32) & 0xFFFFFFFF)
-        self._write_u32(offset + 0xC, value & 0xFFFFFFFF)
-
-    def _wait_status(self, mask: int, timeout_s: float = 2.0) -> int:
-        t0 = perf_counter()
-        while True:
-            status = self._read_u32(STATUS)
-            if status & mask:
-                return status
-            if perf_counter() - t0 > timeout_s:
-                raise TimeoutError(f"Timeout waiting for status 0x{mask:08x}, got 0x{status:08x}")
-
-    def reset_core(self) -> None:
-        self._write_u32(CONTROL, START_RESET)
-
-    def set_key_nonce(self, key: bytes, nonce: bytes) -> None:
-        if len(key) != 16:
-            raise ValueError("Key must be 16 bytes")
-        if len(nonce) != 16:
-            raise ValueError("Nonce must be 16 bytes")
-        self._write_u128(KEY_127_96, int.from_bytes(key, "big"))
-        self._write_u128(NONCE_127_96, int.from_bytes(nonce, "big"))
-
-    def set_mode(self, decrypt: bool = False, has_ad: bool = False) -> None:
-        mode = (1 if decrypt else 0) | ((1 if has_ad else 0) << 1)
-        self._write_u32(MODE, mode)
-
-    def _alloc_buffer(self, data: bytes) -> np.ndarray:
-        buf = allocate(np.zeros(len(data), dtype=np.uint8))
-        if len(data) > 0:
-            buf[:] = np.frombuffer(data, dtype=np.uint8)
-        return buf
-
-    def _alloc_output(self, length: int) -> np.ndarray:
-        return allocate(np.zeros(length, dtype=np.uint8))
-
-    def _dma_transfer(self, role: str, data: bytes, out_length: int) -> bytes:
-        if role not in self.dmas:
-            raise RuntimeError(f"DMA for '{role}' not available in overlay")
-        dma = self.dmas[role]
-        in_buf = self._alloc_buffer(data)
-        out_buf = self._alloc_output(out_length)
-
-        dma.recvchannel.transfer(out_buf)
-        dma.sendchannel.transfer(in_buf)
-        dma.sendchannel.wait()
-        dma.recvchannel.wait()
-
-        return bytes(out_buf[:out_length])
-
-    def aead(self, key: bytes, nonce: bytes, data: bytes, ad: bytes = b"", decrypt: bool = False) -> Dict[str, object]:
-        if len(key) != 16 or len(nonce) != 16:
-            raise ValueError("Key and nonce must be 16 bytes")
-
-        self.reset_core()
-        self.set_key_nonce(key, nonce)
-        self.set_mode(decrypt=decrypt, has_ad=len(ad) > 0)
-
-        control = START_DECRYPT if decrypt else START_ENCRYPT
-        if len(ad) > 0 and "ad" in self.dmas:
-            self._dma_transfer("ad", ad, len(ad))
-
-        c0 = self._read_u32(CYCLE_LO) | (self._read_u32(CYCLE_HI) << 32)
-        t0 = perf_counter()
-
-        self._write_u32(CONTROL, control)
-        out_data = self._dma_transfer("dec" if decrypt else "enc", data, len(data))
-
-        status = self._wait_status(ST_DEC_OUT_VALID if decrypt else ST_ENC_OUT_VALID)
-        c1 = self._read_u32(CYCLE_LO) | (self._read_u32(CYCLE_HI) << 32)
-        t1 = perf_counter()
-
-        return {
-            "operation": "decrypt" if decrypt else "encrypt",
-            "key": key,
-            "nonce": nonce,
-            "associated_data": ad,
-            "input": data,
-            "output": out_data,
-            "status": status,
-            "wall_seconds": t1 - t0,
-            "pl_cycles": (c1 - c0) & 0xFFFFFFFFFFFFFFFF,
-        }
-
-    def hash256(self, message: bytes) -> Dict[str, object]:
-        self.reset_core()
-        self._write_u32(MODE, 0)
-
-        c0 = self._read_u32(CYCLE_LO) | (self._read_u32(CYCLE_HI) << 32)
-        t0 = perf_counter()
-
-        digest = self._dma_transfer("hash", message, 32)
-        status = self._wait_status(ST_HASH_VALID)
-
-        c1 = self._read_u32(CYCLE_LO) | (self._read_u32(CYCLE_HI) << 32)
-        t1 = perf_counter()
-
-        return {
-            "operation": "hash256",
-            "input": message,
-            "hash": digest,
-            "status": status,
-            "wall_seconds": t1 - t0,
-            "pl_cycles": (c1 - c0) & 0xFFFFFFFFFFFFFFFF,
-        }
+def selftest(engine=None) -> bool:
+    """Compare the hardware with the reference model on a few vectors."""
+    import random
+    import ascon
+    eng = engine or open_hw()
+    rng = random.Random(3)
+    key, nonce = bytes(range(16)), bytes(range(16, 32))
+    ok = True
+    for n in (0, 1, 7, 8, 9, 15, 16, 17, 100, 1000):
+        msg = bytes(rng.getrandbits(8) for _ in range(n))
+        ok &= eng.hash256(msg) == ascon.ascon_hash(msg)
+        for ad_len in (0, 5, 16, 20):
+            ad = bytes(rng.getrandbits(8) for _ in range(ad_len))
+            ref = ascon.ascon_encrypt(key, nonce, ad, msg)
+            ok &= eng.aead_encrypt(key, nonce, ad, msg) == ref
+            ok &= eng.aead_decrypt(key, nonce, ad, ref) == msg
+    print("hardware selftest:", "PASS" if ok else "FAIL")
+    return ok
 
 
 if __name__ == "__main__":
-    bitfile = "design_1.bit"
-    driver = PYNQASCON(bitfile)
-
-    key = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
-    nonce = bytes.fromhex("101112131415161718191a1b1c1d1e1f")
-    plaintext = b"Hello ASCON on Kria KV260!"
-
-    result = driver.aead(key=key, nonce=nonce, data=plaintext, ad=b"", decrypt=False)
-    print("Encrypt status:", hex(result["status"]))
-    print("Ciphertext:", result["output"].hex())
-    print("Wall time:", result["wall_seconds"])
-    print("PL cycles:", result["pl_cycles"])
-
-    hash_result = driver.hash256(b"abc")
-    print("Hash status:", hex(hash_result["status"]))
-    print("Hash:", hash_result["hash"].hex())
-    print("Wall time:", hash_result["wall_seconds"])
-    print("PL cycles:", hash_result["pl_cycles"])
+    sys.exit(0 if selftest() else 1)

@@ -29,6 +29,7 @@
 module tb_ascon_aead_hash_axi();
     parameter integer SPLIT_ROUND  = 0;
     parameter integer MERGE_ABSORB = 0;
+    parameter integer LEGACY_SCHEDULE = 0;   // accepted for script uniformity (core testbench uses it)
 
     `include "tb_vectors.svh"
 
